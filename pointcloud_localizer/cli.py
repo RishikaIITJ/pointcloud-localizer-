@@ -1,163 +1,88 @@
-
-# cli.py — Command-line interface for pointcloud-localizer.
-
-import argparse
 import numpy as np
+import os
 import sys
 
+from pointcloud_localizer.synthetic import create_pair, transformation_matrix, transform
+from pointcloud_localizer.preprocess import voxel_downsample
+from pointcloud_localizer.icp import icp
+from pointcloud_localizer.loader import save_pc
+from pointcloud_localizer.evaluate import evaluate_registration, rotation_error, translation_error, before_after, rmse_curve, sweep
 
-def _parse_args():
-    p = argparse.ArgumentParser(
-        description="pointcloud-localizer: ICP-based 3-D scan registration",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    p.add_argument("--mode", choices=["synthetic", "file", "sweep"],
-                   default="synthetic",
-                   help="Run mode: synthetic demo | real files | robustness sweep")
+def run_register(mesh_path, n_pts, sigma, rx, ry, rz,tx, ty, tz,voxel_size, max_iters,tol, outlier_ratio, output_dir):
 
-    # Synthetic options
-    p.add_argument("--n-points", type=int, default=5000,
-                   help="Number of source points (synthetic mode)")
-    p.add_argument("--noise", type=float, default=0.005,
-                   help="Gaussian noise σ (m) added to clouds (synthetic)")
-    p.add_argument("--shape", choices=["composite", "sphere", "box", "cylinder"],
-                   default="composite", help="Surface shape to sample")
-    p.add_argument("--rx", type=float, default=0.1,
-                   help="Ground-truth rotation about X (radians)")
-    p.add_argument("--ry", type=float, default=0.15,
-                   help="Ground-truth rotation about Y (radians)")
-    p.add_argument("--rz", type=float, default=0.05,
-                   help="Ground-truth rotation about Z (radians)")
-    p.add_argument("--tx", type=float, default=0.1,
-                   help="Ground-truth translation X (m)")
-    p.add_argument("--ty", type=float, default=0.05,
-                   help="Ground-truth translation Y (m)")
-    p.add_argument("--tz", type=float, default=0.02,
-                   help="Ground-truth translation Z (m)")
+    src, tgt, T_gt = create_pair(mesh_path, n_pts, sigma,rx, ry, rz, tx, ty, tz)
 
-    # File options
-    p.add_argument("--source", type=str, default=None,
-                   help="Path to source .ply/.pcd (file mode)")
-    p.add_argument("--target", type=str, default=None,
-                   help="Path to target .ply/.pcd (file mode)")
+    src_ds = voxel_downsample(src, voxel_size)
+    tgt_ds = voxel_downsample(tgt, voxel_size)
 
-    # ICP options
-    p.add_argument("--voxel-size", type=float, default=0.05,
-                   help="Voxel downsampling size (m). Set 0 to skip.")
-    p.add_argument("--max-iter", type=int, default=150,
-                   help="Max ICP iterations")
-    p.add_argument("--tolerance", type=float, default=1e-6,
-                   help="ICP convergence tolerance on ΔRMSE")
-    p.add_argument("--outlier-ratio", type=float, default=0.1,
-                   help="Fraction of worst correspondences to reject each iter")
-    p.add_argument("--max-dist", type=float, default=None,
-                   help="Max correspondence distance (m). Auto if not set.")
+    result = icp(src_ds, tgt_ds, max_iters=max_iters,tol=tol, outlier_ratio=outlier_ratio,verbose=True)
 
-    # Output
-    p.add_argument("--output-dir", type=str, default="output",
-                   help="Directory for output plots")
-    p.add_argument("--quiet", action="store_true",
-                   help="Suppress per-iteration ICP output")
+    evaluate_registration(result["transformation"], T_gt, result["rmse_history"], result["n_iterations"])
 
-    return p.parse_args()
+    os.makedirs(output_dir, exist_ok=True)
+
+    before_after(src_ds, tgt_ds, result["aligned_source"],output_path=os.path.join(output_dir, "before_after.png"))
+
+    rmse_curve(result["rmse_history"],output_path=os.path.join(output_dir, "rmse_curve.png"))
+   
+    save_pc(result["aligned_source"],os.path.join(output_dir,"aligned_source.ply"))
 
 
-def run_synthetic(args):
-    from pointcloud_localizer.synthetic import generate_synthetic_pair
-    from pointcloud_localizer.preprocess import voxel_downsample
-    from pointcloud_localizer.icp import icp
-    from pointcloud_localizer.evaluate import (
-        evaluate_registration, plot_before_after, plot_rmse_curve
-    )
+def run_sweep(mesh_path, n_pts, rx, ry, rz, tx, ty, tz, voxel_size, max_iters, tol, outlier_ratio, output_dir):
 
-    print("\n=== Synthetic mode ===")
-    src, tgt, T_gt = generate_synthetic_pair(
-        n_points=args.n_points,
-        noise_sigma=args.noise,
-        rx=args.rx, ry=args.ry, rz=args.rz,
-        tx=args.tx, ty=args.ty, tz=args.tz,
-        shape=args.shape,
-        seed=42,
-    )
+   
+    sigmas = [0.0, 0.005, 0.02]
+    misalignments = [5, 15, 30]
 
-    src_ds = voxel_downsample(src, args.voxel_size) if args.voxel_size > 0 else src
-    tgt_ds = voxel_downsample(tgt, args.voxel_size) if args.voxel_size > 0 else tgt
+    rot_errors   = np.zeros((3, 3))
+    trans_errors = np.zeros((3, 3))
+    rmse_final   = np.zeros((3, 3))
+    n_iters      = np.zeros((3, 3))
 
-    result = icp(
-        src_ds, tgt_ds,
-        max_iterations=args.max_iter,
-        tolerance=args.tolerance,
-        max_correspondence_dist=args.max_dist,
-        outlier_ratio=args.outlier_ratio,
-        verbose=not args.quiet,
-    )
+    for i, sigma in enumerate(sigmas):
+        for j, mis in enumerate(misalignments):
 
-    metrics = evaluate_registration(
-        result["transform"], T_gt,
-        result["rmse_history"], result["n_iterations"]
-    )
+            src, tgt, T_gt = create_pair(mesh_path, n_pts, sigma, rx, ry, rz,tx, ty, tz)
 
-    odir = args.output_dir
-    plot_before_after(src_ds, tgt_ds, result["aligned_source"],
-                      output_path=f"{odir}/before_after.png")
-    plot_rmse_curve(result["rmse_history"],
-                    output_path=f"{odir}/rmse_curve.png")
+            src_ds = voxel_downsample(src, voxel_size)
+            tgt_ds = voxel_downsample(tgt, voxel_size)
 
-    return metrics
+            mis_rad = np.radians(mis)
+            T_mis = transformation_matrix(mis_rad, mis_rad*0.5, mis_rad*0.3,tx+0.02,ty+0.01,tz+0.01)
+            src_mis = transform(src_ds, T_mis)
 
+            result = icp(src_mis,tgt_ds,max_iters=max_iters,tol=tol, outlier_ratio=outlier_ratio,verbose=False)
 
-def run_file(args):
-    from pointcloud_localizer.loader import load_pc
-    from pointcloud_localizer.preprocess import voxel
-    from pointcloud_localizer.icp import icp
-    from pointcloud_localizer.evaluate import plot_before_after, plot_rmse_curve
+            T_combined = result["transformation"] @ T_mis
 
-    if not args.source or not args.target:
-        print("ERROR: --source and --target are required in file mode", file=sys.stderr)
-        sys.exit(1)
+            rot_errors[i, j]   = rotation_error(T_combined, T_gt)
+            trans_errors[i, j] = translation_error(T_combined, T_gt)
+            rmse_final[i, j]   = result["final_rmse"]
+            n_iters[i, j]      = result["n_iterations"]
 
-    print("\n=== File mode ===")
-    src = load_pc(args.source)
-    tgt = load_pc(args.target)
-
-    src_ds = voxel(src, args.voxel_size) if args.voxel_size > 0 else src
-    tgt_ds = voxel(tgt, args.voxel_size) if args.voxel_size > 0 else tgt
-
-    result = icp(
-        src_ds, tgt_ds,
-        max_iterations=args.max_iter,
-        tolerance=args.tolerance,
-        max_correspondence_dist=args.max_dist,
-        outlier_ratio=args.outlier_ratio,
-        verbose=not args.quiet,
-    )
-
-    odir = args.output_dir
-    plot_before_after(src_ds, tgt_ds, result["aligned_source"],
-                      output_path=f"{odir}/before_after.png")
-    plot_rmse_curve(result["rmse_history"],
-                    output_path=f"{odir}/rmse_curve.png")
-
-    print(f"\nEstimated transform (source → target):\n{result['transform']}")
-    print(f"Final RMSE: {result['final_rmse']:.6f} m")
-
-
-def run_sweep(args):
-    from pointcloud_localizer.evaluate import run_robustness_sweep
-    print("\n=== Robustness sweep ===")
-    run_robustness_sweep(output_dir=args.output_dir)
-
-
-def main():
-    args = _parse_args()
-    
-    if args.mode == "synthetic":
-        run_synthetic(args)
-    elif args.mode == "file":
-        run_file(args)
-    elif args.mode == "sweep":
-        run_sweep(args)
-
+    sweep(rot_errors,trans_errors,rmse_final,n_iters,sigmas,misalignments,output_path=os.path.join(output_dir, "robustness.png"))
 
 if __name__ == "__main__":
-    main()
+
+    mode = "sweep"  # "register" or "sweep"
+
+    mesh = "reconstruction/bun_zipper_res2.ply"
+    n_pts = 5000
+    sigma = 0.001
+    rx, ry, rz = 0.1, 0.1, 0.05
+    tx, ty, tz = 0.05, 0.03, 0.02
+    voxel_size = 0.003
+    max_iters = 150
+    tol = 1e-6
+    outlier_ratio = 0.1
+    output_dir = "output"
+
+    if mode == "register":
+        run_register(mesh, n_pts, sigma,rx, ry, rz, tx, ty, tz,voxel_size, max_iters, tol,outlier_ratio, output_dir)
+
+    elif mode == "sweep":
+        run_sweep(mesh, n_pts, rx, ry, rz, tx, ty, tz, voxel_size, max_iters, tol, outlier_ratio, output_dir)
+
+    else:
+        print(f"Unknown mode: {mode}")
+        sys.exit(1)
