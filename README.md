@@ -1,4 +1,4 @@
-# Pointcloud-Lcalizer
+# Pointcloud-Localizer
 
 A self-contained ICP-based 3-D point cloud registration and localisation toolkit.
 **The entire ICP loop is hand-rolled** — no `open3d.registration`, PCL, or any
